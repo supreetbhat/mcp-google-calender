@@ -227,5 +227,101 @@ async def mcp_create_event(request: Request, inputs: CreateEventInput):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     
-    if __name__ == "__main__":
-        uvicorn.run(app, host="127.0.0.1", port=8000)
+class UpdateEventInput(BaseModel):
+    summary: Optional[str] = None
+    start_time: Optional[str] = None  # e.g., "2025-10-31T10:00:00Z"
+    end_time: Optional[str] = None    # e.g., "2025-10-31T11:00:00Z"
+    location: Optional[str] = None
+    description: Optional[str] = None
+
+class PatchEventInput(BaseModel):
+    event_id: str  # The ID of the event you want to change
+    updates: UpdateEventInput
+
+@app.post("/mcp/tools/updateEvent")
+async def mcp_update_event(request: Request, inputs: PatchEventInput):
+    """
+    MCP Tool: Updates an existing event in the user's primary calendar.
+    """
+    try:
+        creds = get_google_credentials(request)
+        service = build("calendar", "v3", credentials=creds)
+
+        # 1. Create the update body
+        # We use .model_dump(exclude_unset=True) to only include
+        # fields that the client actually sent.
+        update_body = inputs.updates.model_dump(exclude_unset=True)
+        
+        # 2. Rename fields to match Google's API if needed
+        if "start_time" in update_body:
+            update_body["start"] = {"dateTime": update_body.pop("start_time"), "timeZone": "UTC"}
+        if "end_time" in update_body:
+            update_body["end"] = {"dateTime": update_body.pop("end_time"), "timeZone": "UTC"}
+
+        if not update_body:
+            raise HTTPException(status_code=400, detail="No update fields provided.")
+
+        # 3. Call the Google Calendar API's .patch() method
+        print(f"Patching event: {inputs.event_id}")
+        updated_event = (
+            service.events()
+            .patch(
+                calendarId="primary",
+                eventId=inputs.event_id,
+                body=update_body,
+                sendNotifications=True,
+            )
+            .execute()
+        )
+
+        # 4. Return a clean MCP-formatted response
+        return {
+            "status": "success",
+            "id": updated_event["id"],
+            "summary": updated_event.get("summary"),
+            "htmlLink": updated_event.get("htmlLink"),
+        }
+
+    except HttpError as e:
+        raise HTTPException(status_code=e.status_code, detail=f"Google API Error: {e.reason}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+class DeleteEventInput(BaseModel):
+    event_id: str  # The ID of the event you want to delete   
+
+@app.post("/mcp/tools/deleteEvent")
+async def mcp_delete_event(request: Request, inputs: DeleteEventInput):
+    """
+    MCP Tool: Deletes an event from the user's primary calendar.
+    """
+    try:
+        creds = get_google_credentials(request)
+        service = build("calendar", "v3", credentials=creds)
+
+        # 1. Call the Google Calendar API's .delete() method
+        print(f"Deleting event: {inputs.event_id}")
+        service.events().delete(
+            calendarId="primary",
+            eventId=inputs.event_id,
+            sendNotifications=True,
+        ).execute()
+
+        # 2. Return a simple success message
+        # A successful delete returns no content (HTTP 204),
+        # so we just confirm it.
+        return {
+            "status": "success",
+            "deleted_event_id": inputs.event_id
+        }
+
+    except HttpError as e:
+        # Handle "Not Found" error gracefully
+        if e.status_code == 404:
+            raise HTTPException(status_code=404, detail="Event not found.")
+        raise HTTPException(status_code=e.status_code, detail=f"Google API Error: {e.reason}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8000)
