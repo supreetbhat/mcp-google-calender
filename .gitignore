@@ -1,3 +1,4 @@
 google-mcp
 .env
 .gitignore
+__pycache__
