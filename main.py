@@ -9,7 +9,8 @@ from typing import List, Optional
 
 # --- New Database Imports ---
 from sqlalchemy.orm import Session
-from . import models, database  # Import our new files
+import models
+import database  # Import our new files
 
 # --- New Auth Imports ---
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
