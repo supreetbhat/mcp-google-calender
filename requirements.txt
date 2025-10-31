@@ -13,3 +13,4 @@ pydantic-settings
 # Session/token handling / multipart
 itsdangerous
 python-multipart
+mcp
