@@ -1,17 +1,10 @@
 # models.py
-from sqlalchemy import Column, Integer, String, UniqueConstraint
+from sqlalchemy import Column, Integer, String
 from database import Base
 
-class User(Base):
-    __tablename__ = "users"
+class TokenStorage(Base):
+    __tablename__ = "token_storage"
 
-    id = Column(Integer, primary_key=True, index=True)
-    email = Column(String, unique=True, index=True, nullable=False)
-    
-    # This is the unique API key we will give to the client
-    api_key = Column(String, unique=True, index=True, nullable=False)
-    
-    # This is the permanent token we store to act on their behalf
+    # We'll only ever have one row, with id=1
+    id = Column(Integer, primary_key=True, default=1)
     refresh_token = Column(String, nullable=False)
-
-    __table_args__ = (UniqueConstraint('email'), UniqueConstraint('api_key'))
