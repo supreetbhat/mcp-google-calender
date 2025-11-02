@@ -1,0 +1,6 @@
+google-mcp
+.env
+.gitignore
+__pycache__
+sql_app.db
+.vscode
