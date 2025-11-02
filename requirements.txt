@@ -1,16 +1,8 @@
-# Requirements for the MCP Google Calendar project
-# Server
 fastapi
 uvicorn[standard]
-
-# Google API / OAuth
 google-api-python-client
 google-auth-oauthlib
-
-# Settings / .env handling
+httpx
+sqlalchemy
 pydantic-settings
-
-# Session/token handling / multipart
-itsdangerous
-python-multipart
-mcp
+mcp[cli]

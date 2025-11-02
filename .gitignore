@@ -3,3 +3,4 @@ google-mcp
 .gitignore
 __pycache__
 sql_app.db
+.vscode

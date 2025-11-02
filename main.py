@@ -3,14 +3,14 @@ import uvicorn
 import datetime
 import sys
 import argparse
-from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import FastAPI, Request, HTTPException, Depends # We still need HTTPException for the auth server
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from typing import List, Optional
 
 # --- MCP Imports ---
 from mcp.server.fastmcp import FastMCP # This is the main SDK class
-# NO MORE JSON-RPC IMPORTS NEEDED
+
 
 # --- Database Imports ---
 from sqlalchemy.orm import Session
@@ -33,13 +33,10 @@ from settings import settings
 models.Base.metadata.create_all(bind=database.engine)
 
 # --- Server Definitions ---
-# 1. The MCP Server (for Claude)
 mcp = FastMCP("google_calendar")
-
-# 2. The Auth Server (for one-time login)
 auth_app = FastAPI()
 
-# --- Dependencies ---
+# --- Dependencies (FOR AUTH APP ONLY) ---
 def get_db():
     db = database.SessionLocal()
     try:
@@ -47,11 +44,9 @@ def get_db():
     finally:
         db.close()
 
-bearer_scheme = HTTPBearer() # We still need this for the *auth* server
-
 SCOPES = [
-    "https.www.googleapis.com/auth/calendar", 
-    "https.www.googleapis.com/auth/userinfo.email", 
+    "https://www.googleapis.com/auth/calendar", 
+    "https://www.googleapis.com/auth/userinfo.email", 
     "openid"
 ]
 CLIENT_CONFIG = {
@@ -65,34 +60,35 @@ CLIENT_CONFIG = {
 }
 
 # --- Helper Function (The "Bouncer") ---
-def get_google_credentials(db: Session = Depends(get_db)) -> Credentials:
+def get_google_credentials() -> Credentials:
     """
-    Retrieves the stored refresh_token from the database
+    Manually creates a DB session, retrieves the stored refresh_token,
     and returns fresh, valid Google Credentials.
-    
-    This is now a dependency for our MCP tools.
     """
-    token_row = db.query(models.TokenStorage).filter(models.TokenStorage.id == 1).first()
-    
-    if not token_row or not token_row.refresh_token:
-        print("ERROR: No refresh token found. Run 'python main.py --auth'", file=sys.stderr)
-        # FastMCP will catch HTTPException and convert it to an MCP error
-        raise HTTPException(status_code=401, detail="Server not authenticated. Please run 'python main.py --auth' in your terminal.")
-
-    creds = Credentials.from_authorized_user_info({
-        "refresh_token": token_row.refresh_token,
-        "token_uri": CLIENT_CONFIG["web"]["token_uri"],
-        "client_id": CLIENT_CONFIG["web"]["client_id"],
-        "client_secret": CLIENT_CONFIG["web"]["client_secret"],
-    }, SCOPES)
-
+    db = database.SessionLocal()
     try:
+        token_row = db.query(models.TokenStorage).filter(models.TokenStorage.id == 1).first()
+        
+        if not token_row or not token_row.refresh_token:
+            print("ERROR: No refresh token found. Run 'python main.py --auth'", file=sys.stderr)
+            # Raise a standard Exception for FastMCP to catch
+            raise Exception("Server not authenticated. Please run 'python main.py --auth' in your terminal.")
+
+        creds = Credentials.from_authorized_user_info({
+            "refresh_token": token_row.refresh_token,
+            "token_uri": CLIENT_CONFIG["web"]["token_uri"],
+            "client_id": CLIENT_CONFIG["web"]["client_id"],
+            "client_secret": CLIENT_CONFIG["web"]["client_secret"],
+        }, SCOPES)
+
         creds.refresh(AuthRequest())
+        return creds
+    
     except Exception as e:
-        print(f"ERROR: Could not refresh token. Run 'python main.py --auth'. Error: {e}", file=sys.stderr)
-        raise HTTPException(status_code=401, detail=f"Could not refresh token. Please re-authenticate via 'python main.py --auth'.")
-            
-    return creds
+        print(f"ERROR: Could not get credentials. Run 'python main.py --auth'. Error: {e}", file=sys.stderr)
+        raise Exception(f"Could not get credentials. Please re-authenticate via 'python main.py --auth'. Original error: {e}")
+    finally:
+        db.close()
 
 
 # --- MCP Pydantic Models (Unchanged) ---
@@ -124,13 +120,10 @@ class DeleteEventInput(BaseModel):
     event_id: str
 
 
-# --- MCP Endpoints (Registered with FastMCP) ---
+# --- MCP Endpoints (UPDATED with correct Error Handling) ---
 
 @mcp.tool()
-async def get_events(
-    inputs: GetEventsInput, 
-    creds: Credentials = Depends(get_google_credentials) # Auth works the same!
-) -> dict:
+async def get_events(inputs: GetEventsInput) -> dict:
     """
     Get events from the user's Google Calendar.
     
@@ -138,6 +131,7 @@ async def get_events(
         inputs: The event filter.
     """
     try:
+        creds = get_google_credentials()
         service = build("calendar", "v3", credentials=creds)
         if inputs.timeMin == "now":
             inputs.timeMin = datetime.datetime.utcnow().isoformat() + "Z"
@@ -158,13 +152,13 @@ async def get_events(
         ]
         return {"events": formatted_events}
     except HttpError as e:
-        raise HTTPException(status_code=e.status_code, detail=f"Google API Error: {e.reason}")
+        raise Exception(f"Google API Error: {e.reason}")
+    except Exception as e:
+        # Re-raise any error from our helper
+        raise e
 
 @mcp.tool()
-async def create_event(
-    inputs: CreateEventInput,
-    creds: Credentials = Depends(get_google_credentials)
-) -> dict:
+async def create_event(inputs: CreateEventInput) -> dict:
     """
     Creates a new event in the user's primary calendar.
     
@@ -172,6 +166,7 @@ async def create_event(
         inputs: The details for the new event.
     """
     try:
+        creds = get_google_credentials()
         service = build("calendar", "v3", credentials=creds)
         event_body = {
             "summary": inputs.summary,
@@ -193,13 +188,12 @@ async def create_event(
             "htmlLink": created_event.get("htmlLink"),
         }
     except HttpError as e:
-        raise HTTPException(status_code=e.status_code, detail=f"Google API Error: {e.reason}")
+        raise Exception(f"Google API Error: {e.reason}")
+    except Exception as e:
+        raise e
 
 @mcp.tool()
-async def update_event(
-    inputs: PatchEventInput,
-    creds: Credentials = Depends(get_google_credentials)
-) -> dict:
+async def update_event(inputs: PatchEventInput) -> dict:
     """
     Updates an existing event in the user's primary calendar.
     
@@ -207,6 +201,7 @@ async def update_event(
         inputs: The event ID and the fields to update.
     """
     try:
+        creds = get_google_credentials()
         service = build("calendar", "v3", credentials=creds)
         update_body = inputs.updates.model_dump(exclude_unset=True)
         
@@ -216,7 +211,7 @@ async def update_event(
             update_body["end"] = {"dateTime": update_body.pop("end_time"), "timeZone": "UTC"}
 
         if not update_body:
-            raise HTTPException(status_code=400, detail="No update fields provided.")
+            raise Exception("No update fields provided.")
 
         updated_event = service.events().patch(
             calendarId="primary", eventId=inputs.event_id,
@@ -229,13 +224,12 @@ async def update_event(
             "htmlLink": updated_event.get("htmlLink"),
         }
     except HttpError as e:
-        raise HTTPException(status_code=e.status_code, detail=f"Google API Error: {e.reason}")
+        raise Exception(f"Google API Error: {e.reason}")
+    except Exception as e:
+        raise e
 
 @mcp.tool()
-async def delete_event(
-    inputs: DeleteEventInput,
-    creds: Credentials = Depends(get_google_credentials)
-) -> dict:
+async def delete_event(inputs: DeleteEventInput) -> dict:
     """
     Deletes an event from the user's primary calendar.
     
@@ -243,6 +237,7 @@ async def delete_event(
         inputs: The ID of the event to delete.
     """
     try:
+        creds = get_google_credentials()
         service = build("calendar", "v3", credentials=creds)
         
         service.events().delete(
@@ -252,8 +247,10 @@ async def delete_event(
         return {"status": "success", "deleted_event_id": inputs.event_id}
     except HttpError as e:
         if e.status_code == 404:
-            raise HTTPException(status_code=404, detail="Event not found.")
-        raise HTTPException(status_code=e.status_code, detail=f"Google API Error: {e.reason}")
+            raise Exception("Event not found.")
+        raise Exception(f"Google API Error: {e.reason}")
+    except Exception as e:
+        raise e
 
 
 # --- Auth Server Endpoints (for one-time browser login) ---
@@ -311,8 +308,6 @@ def main():
         uvicorn.run(auth_app, host="127.0.0.1", port=8000)
     else:
         # This is the default. It runs the MCP server for Claude Desktop.
-        # It communicates over stdio, not HTTP.
-        # Do not add print() statements here, as they break JSON-RPC.
         mcp.run(transport='stdio')
 
 if __name__ == "__main__":
