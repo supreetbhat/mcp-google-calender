@@ -47,7 +47,8 @@ def get_db():
 SCOPES = [
     "https://www.googleapis.com/auth/calendar", 
     "https://www.googleapis.com/auth/userinfo.email", 
-    "openid"
+    "openid",
+    "https://www.googleapis.com/auth/gmail.readonly"
 ]
 CLIENT_CONFIG = {
     "web": {
