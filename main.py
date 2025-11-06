@@ -3,6 +3,7 @@ import uvicorn
 import datetime
 import sys
 import argparse
+import datetime
 from fastapi import FastAPI, Request, HTTPException, Depends # We still need HTTPException for the auth server
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
@@ -92,6 +93,7 @@ def get_google_credentials() -> Credentials:
         db.close()
 
 
+
 # --- MCP Pydantic Models (Unchanged) ---
 class GetEventsInput(BaseModel):
     timeMin: str = "now"
@@ -120,43 +122,147 @@ class PatchEventInput(BaseModel):
 class DeleteEventInput(BaseModel):
     event_id: str
 
+class PotentialEvent(BaseModel):
+    source: str = "gmail"
+    subject: str
+    snippet: str
+    message_id: str
 
+def scan_gmail_for_potential_events(
+    creds: Credentials,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+) -> List[PotentialEvent]:
+    """
+    Scans Gmail for potential events and returns them as a list.
+    """
+    try:
+        service = build("gmail", "v1", credentials=creds)
+        
+        # 1. Search for emails with keywords
+        # We'll combine multiple queries with { }
+        # This looks for unread emails in the inbox with event-related keywords
+        # Limit scan to past 30 days by default
+# --- Build Gmail search query ---
+        if start_date and end_date:
+            query = f"in:inbox after:{start_date} before:{end_date} {{flight confirmation booking hotel reservation zoom.us/j meet.google.com/}}"
+        else:
+            # Default: last 30 days
+            thirty_days_ago = (datetime.datetime.utcnow() - datetime.timedelta(days=30)).strftime("%Y/%m/%d")
+            query = f"in:inbox after:{thirty_days_ago} {{flight confirmation booking hotel reservation zoom.us/j meet.google.com/}}"
+
+
+        response = service.users().messages().list(
+            userId="me",
+            q=query,
+            maxResults=10  # Limit to 10 potential events
+        ).execute()
+        
+        messages = response.get("messages", [])
+        potential_events = []
+        
+        if not messages:
+            return [] # No potential events found
+
+        # 2. Get details for each message
+        for msg in messages:
+            msg_data = service.users().messages().get(
+                userId="me", 
+                id=msg["id"], 
+                format="metadata" # We only need headers and snippet, not the full body
+            ).execute()
+            
+            payload = msg_data.get("payload", {})
+            headers = payload.get("headers", [])
+            
+            subject = ""
+            for h in headers:
+                if h["name"].lower() == "subject":
+                    subject = h["value"]
+                    break
+            
+            snippet = msg_data.get("snippet", "No snippet available.")
+            
+            potential_events.append(
+                PotentialEvent(
+                    subject=subject,
+                    snippet=snippet,
+                    message_id=msg["id"]
+                )
+            )
+            
+        return potential_events
+        
+    except HttpError as e:
+        # If Gmail API fails, just log it and return an empty list
+        print(f"ERROR: Could not scan Gmail. {e}", file=sys.stderr)
+        return []
+    except Exception as e:
+        print(f"ERROR: Unexpected error in Gmail scan. {e}", file=sys.stderr)
+        return []
 # --- MCP Endpoints (UPDATED with correct Error Handling) ---
 
 @mcp.tool()
-async def get_events(inputs: GetEventsInput) -> dict:
+async def get_events(
+    inputs: GetEventsInput
+) -> dict: # The return type is a generic dict
     """
-    Get events from the user's Google Calendar.
+    Get events from the user's Google Calendar AND scan Gmail for potential events.
     
     Args:
-        inputs: The event filter.
+        inputs: The event filter for the calendar.
     """
+    calendar_events_list = []
+    potential_events_list = []
+    
     try:
+        # --- 1. Get Credentials ---
+        # We get the credentials once, which now have both calendar and gmail scopes
         creds = get_google_credentials()
-        service = build("calendar", "v3", credentials=creds)
-        if inputs.timeMin == "now":
-            inputs.timeMin = datetime.datetime.utcnow().isoformat() + "Z"
+
+        # --- 2. Get Calendar Events (Original Logic) ---
+        try:
+            service_cal = build("calendar", "v3", credentials=creds)
+            if inputs.timeMin == "now":
+                inputs.timeMin = datetime.datetime.utcnow().isoformat() + "Z"
+            
+            events_result = service_cal.events().list(
+                calendarId="primary", timeMin=inputs.timeMin, timeMax=inputs.timeMax,
+                maxResults=inputs.maxResults, singleEvents=True, orderBy="startTime",
+            ).execute()
+            events = events_result.get("items", [])
+            calendar_events_list = [
+                {
+                    "id": event["id"],
+                    "summary": event.get("summary", "No Title"),
+                    "start": event["start"].get("dateTime", event["start"].get("date")),
+                    "end": event["end"].get("dateTime", event["end"].get("date")),
+                }
+                for event in events
+            ]
+        except HttpError as e:
+            # If calendar fails, we can still try Gmail
+            print(f"ERROR: Could not get calendar events. {e}", file=sys.stderr)
         
-        events_result = service.events().list(
-            calendarId="primary", timeMin=inputs.timeMin, timeMax=inputs.timeMax,
-            maxResults=inputs.maxResults, singleEvents=True, orderBy="startTime",
-        ).execute()
-        events = events_result.get("items", [])
-        formatted_events = [
-            {
-                "id": event["id"],
-                "summary": event.get("summary", "No Title"),
-                "start": event["start"].get("dateTime", event["start"].get("date")),
-                "end": event["end"].get("dateTime", event["end"].get("date")),
-            }
-            for event in events
-        ]
-        return {"events": formatted_events}
-    except HttpError as e:
-        raise Exception(f"Google API Error: {e.reason}")
+        # --- 3. Get Potential Gmail Events (New Logic) ---
+        # We call our new sync helper function using the same credentials
+        potential_events_list = scan_gmail_for_potential_events(
+            creds,
+            start_date=inputs.timeMin,
+            end_date=inputs.timeMax
+        )
+
+
+        # --- 4. Return Combined Results ---
+        return {
+            "calendar_events": calendar_events_list,
+            "potential_events_from_gmail": [event.model_dump() for event in potential_events_list]
+        }
+        
     except Exception as e:
-        # Re-raise any error from our helper
-        raise e
+        # This catches any errors from get_google_credentials() or other unexpected issues
+        print(f"ERROR in get_events: {e}", file=sys.stderr)
+        raise Exception(f"Failed to get events: {e}")
 
 @mcp.tool()
 async def create_event(inputs: CreateEventInput) -> dict:
